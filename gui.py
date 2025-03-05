@@ -46,6 +46,7 @@ np.random.seed(2023)
 SAM_MODEL_TYPE = "vit_b"
 MedSAM_CKPT_PATH = "work_dir/MedSAM/medsam_vit_b.pth"
 MEDSAM_IMG_INPUT_SIZE = 1024
+import h5py
 
 if torch.backends.mps.is_available():
     device = torch.device("mps")
@@ -194,7 +195,7 @@ class Window(QWidget):
 
     def load_image(self):
         file_path, file_type = QFileDialog.getOpenFileName(
-            self, "Choose Image to Segment", ".", "Image Files (*.png *.jpg *.bmp)"
+            self, "Choose Image to Segment", ".", "Image Files (*.png *.jpeg *.bmp, *.h5)"
         )
 
         if file_path is None or len(file_path) == 0:

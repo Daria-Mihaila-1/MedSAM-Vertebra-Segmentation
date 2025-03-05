@@ -31,6 +31,9 @@ voxel_num_thre3d = 1000
 
 names = sorted(os.listdir(gt_path))
 print(f"ori \# files {len(names)=}")
+# filter the names of the labels by
+# if the curr name of the label (ground truth) + the name of the label without extension + the _0000.nii.gz exists
+# keep only names of labels that have an image equivalent
 names = [
     name
     for name in names
@@ -41,7 +44,7 @@ print(f"after sanity check \# files {len(names)=}")
 # set label ids that are excluded
 remove_label_ids = [
     12
-]  # remove deodenum since it is scattered in the image, which is hard to specify with the bounding box
+]  # remove duodenum since it is scattered in the image, which is hard to specify with the bounding box
 tumor_id = None  # only set this when there are multiple tumors; convert semantic masks to instance masks
 # set window level and width
 # https://radiopaedia.org/articles/windowing-ct

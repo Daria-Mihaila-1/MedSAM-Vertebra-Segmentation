@@ -3,11 +3,16 @@
 train the image encoder and mask decoder
 freeze prompt image encoder
 """
+import matplotlib
 
+import VertebraDataset
+
+matplotlib.use('TkAgg')
 # %% setup environment
 import numpy as np
 import matplotlib.pyplot as plt
 import os
+from VertebraDataset import VertebraDatasetMedSAM
 
 join = os.path.join
 from tqdm import tqdm
@@ -23,6 +28,8 @@ import random
 from datetime import datetime
 import shutil
 import glob
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 
 # set seeds
 torch.manual_seed(2023)
@@ -42,21 +49,23 @@ def show_mask(mask, ax, random_color=False):
         color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
     else:
         color = np.array([251 / 255, 252 / 255, 30 / 255, 0.6])
+    print(mask.shape)
     h, w = mask.shape[-2:]
     mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
     ax.imshow(mask_image)
 
 
-def show_box(box, ax):
-    x0, y0 = box[0], box[1]
-    w, h = box[2] - box[0], box[3] - box[1]
-    ax.add_patch(
-        plt.Rectangle((x0, y0), w, h, edgecolor="blue", facecolor=(0, 0, 0, 0), lw=2)
-    )
+def show_boxes(boxes, ax):
+    for box in boxes:
+        x0, y0 = int(box[0]), int(box[1])
+        w, h = int(box[2]), int(box[3])
+        ax.add_patch(
+            plt.Rectangle((x0, y0), w, h, edgecolor="blue", facecolor=(0, 0, 0, 0), lw=2)
+        )
 
 
 class NpyDataset(Dataset):
-    def __init__(self, data_root, bbox_shift=20):
+    def __init__(self,data_root, bbox_shift=20):
         self.data_root = data_root
         self.gt_path = join(data_root, "gts")
         self.img_path = join(data_root, "imgs")
@@ -75,6 +84,7 @@ class NpyDataset(Dataset):
         return len(self.gt_path_files)
 
     def __getitem__(self, index):
+        # plt.figure(figsize=(6, 8))
         # load npy image (1024, 1024, 3), [0,1]
         img_name = os.path.basename(self.gt_path_files[index])
         img_1024 = np.load(
@@ -83,19 +93,24 @@ class NpyDataset(Dataset):
         # convert the shape to (3, H, W)
         img_1024 = np.transpose(img_1024, (2, 0, 1))
         assert (
-            np.max(img_1024) <= 1.0 and np.min(img_1024) >= 0.0
+                np.max(img_1024) <= 1.0 and np.min(img_1024) >= 0.0
         ), "image should be normalized to [0, 1]"
         gt = np.load(
             self.gt_path_files[index], "r", allow_pickle=True
-        )  # multiple labels [0, 1,4,5...], (256,256)
-        assert img_name == os.path.basename(self.gt_path_files[index]), (
-            "img gt name error" + self.gt_path_files[index] + self.npy_files[index]
         )
+        # print(f"Ground truth shape: {gt.shape}")
+        # multiple labels [0, 1,4,5...], (256,256)
+        assert img_name == os.path.basename(self.gt_path_files[index]), (
+                "img gt name error" + self.gt_path_files[index] + self.npy_files[index]
+        )
+        # avem si aici niste labeluri de clase--> toate obiectele inafara de background
         label_ids = np.unique(gt)[1:]
-        gt2D = np.uint8(
-            gt == random.choice(label_ids.tolist())
-        )  # only one label, (256, 256)
-        assert np.max(gt2D) == 1 and np.min(gt2D) == 0.0, "ground truth should be 0, 1"
+        random_choice = random.choice(label_ids.tolist())
+        gt2D = np.where(
+            1 in label_ids.tolist(), (gt == 1).astype(np.uint8),
+            (gt == random_choice).astype(np.uint8))
+        # print(f"GT2D shape:{gt2D.shape}")
+        assert np.max(gt2D) == 1 and np.min(gt2D) == 0.0, f"ground truth should be 0, 1, ground truth is {gt2D}"
         y_indices, x_indices = np.where(gt2D > 0)
         x_min, x_max = np.min(x_indices), np.max(x_indices)
         y_min, y_max = np.min(y_indices), np.max(y_indices)
@@ -114,32 +129,87 @@ class NpyDataset(Dataset):
         )
 
 
+def custom_collate_fn(batch):
+    # Separate images and targets
+    images = torch.stack([item[0] for item in batch])
+    masks = [item[1]['masks'] for item in batch]
+
+    max_masks = max([mask.shape[0] for mask in masks])
+
+    padded_masks = torch.stack([
+        torch.cat(
+            [mask, torch.zeros((max_masks - mask.shape[0], mask[0].shape[0], mask[0].shape[0]), device=mask.device, dtype=mask.dtype)], dim=0)
+            for mask in masks],
+        dim=0)  # pad masks so that each image looks like it has the same number of masks add [0,0,0,0] masks
+
+    # masks:
+    # mask1 =-->torch.Tensor(16, 1024, 1024)
+    # mask2 --> torch.Tensor(18, 1024, 1024)
+    # tensors: in masks
+    # mask1 --> (torch.Tensor(1024, 1024), torch.Tensor(1024, 1024) ... x 16
+    # binary_masks = torch.stack([torch.any(mask, dim=0).float() for mask in masks])
+
+    # labels = [item[1]['labels'] for item in batch]
+    # bboxes:
+    # bbox1 --> list of 16
+    #
+    bboxes = [torch.tensor(item[1]['boxes']) for item in batch]
+    max_bboxes = max(bbox.shape[0] for bbox in bboxes)
+    padded_bboxes = torch.stack([
+        torch.cat([bbox, torch.zeros((max_bboxes - bbox.shape[0], 4), device=bbox.device)], dim=0)
+        for bbox in bboxes], dim=0)  # pad bboxes so that each image looks like it has the same number of bboxes add [0,0,0,0] bboxes
+
+    img_file_names = [item[2] for item in batch]
+
+    return images, padded_masks, padded_bboxes, img_file_names
+
+
+# instantele diferite de obiecte sunt luate ca aceeasi clasa -->
+# nu au si id uri diferite fiindca cel mai probabil fac parte din acelasi organ doar ca e acoperit de altceva
 # %% sanity test of dataset class
-tr_dataset = NpyDataset("data/npy/CT_Abd")
-tr_dataloader = DataLoader(tr_dataset, batch_size=8, shuffle=True)
-for step, (image, gt, bboxes, names_temp) in enumerate(tr_dataloader):
-    print(image.shape, gt.shape, bboxes.shape)
-    # show the example
-    _, axs = plt.subplots(1, 2, figsize=(25, 25))
-    idx = random.randint(0, 7)
-    axs[0].imshow(image[idx].cpu().permute(1, 2, 0).numpy())
-    show_mask(gt[idx].cpu().numpy(), axs[0])
-    show_box(bboxes[idx].numpy(), axs[0])
-    axs[0].axis("off")
-    # set title
-    axs[0].set_title(names_temp[idx])
-    idx = random.randint(0, 7)
-    axs[1].imshow(image[idx].cpu().permute(1, 2, 0).numpy())
-    show_mask(gt[idx].cpu().numpy(), axs[1])
-    show_box(bboxes[idx].numpy(), axs[1])
-    axs[1].axis("off")
-    # set title
-    axs[1].set_title(names_temp[idx])
-    # plt.show()
-    plt.subplots_adjust(wspace=0.01, hspace=0)
-    plt.savefig("./data_sanitycheck.png", bbox_inches="tight", dpi=300)
-    plt.close()
-    break
+# tr_dataset = NpyDataset("data/npy/CT_Abd")
+annotations_file_path = 'data/annotations_test.json'
+directory = 'scoliosis2-1/test'
+size = 1024
+masks_save_dir = "data/masks_test"
+transform = A.Compose([
+        A.LongestMaxSize(max_size=size),  # Resize the longer side to 1024
+        A.PadIfNeeded(min_height=size, min_width=size, border_mode=0, p=1.0),  # Pad to 1024x1024
+        A.Normalize(mean=0.0, std=1.0),
+        ToTensorV2(),  # Convert image and masks to PyTorch tensors
+    ], bbox_params=A.BboxParams(format='coco', label_fields=['labels']))  # Bounding box params
+
+tr_dataset = VertebraDatasetMedSAM(annotations_file_path,
+                                   directory=directory,
+                                   resize=size,
+                                   transform=transform, masks_save_dir=masks_save_dir)
+tr_dataloader = DataLoader(tr_dataset, batch_size=8, shuffle=True, collate_fn=custom_collate_fn)
+# for step, (image, gt, bboxes, names_temp) in enumerate(tr_dataloader):
+#     # suntem in batchuri de 8 imagini
+#     # print(image.shape, gt.shape, bboxes.shape)
+#
+#     # show the example
+#     _, axs = plt.subplots(1, 2, figsize=(25, 25))
+#     idx = random.randint(0, 7)
+#     axs[0].imshow(image[idx].cpu().permute(1, 2, 0).numpy())
+#     show_mask(gt[idx].cpu().numpy(), axs[0])
+#     show_boxes(np.array(bboxes[idx]), axs[0])
+#     axs[0].axis("off")
+#     # set title
+#     axs[0].set_title(names_temp[idx][0])
+#     idx = random.randint(0, 7)
+#     axs[1].imshow(image[idx].cpu().permute(1, 2, 0).numpy())
+#     show_mask(gt[idx].cpu().numpy(), axs[1])
+#     show_boxes(bboxes[idx].numpy(), axs[1])
+#     axs[1].axis("off")
+#     # set title
+#     axs[1].set_title(names_temp[idx])
+#     plt.show()
+#     plt.subplots_adjust(wspace=0.01, hspace=0)
+#     print("Sunt aici la plotat")
+#     plt.savefig("./data_sanitycheck.png", bbox_inches="tight", dpi=300)
+#     plt.close()
+#     break
 
 # %% set up parser
 parser = argparse.ArgumentParser()
@@ -153,7 +223,7 @@ parser.add_argument(
 parser.add_argument("-task_name", type=str, default="MedSAM-ViT-B")
 parser.add_argument("-model_type", type=str, default="vit_b")
 parser.add_argument(
-    "-checkpoint", type=str, default="work_dir/SAM/sam_vit_b_01ec64.pth"
+    "-checkpoint", type=str, default="work_dir/MedSAM/sam_vit_b_01ec64.pth"
 )
 # parser.add_argument('-device', type=str, default='cuda:0')
 parser.add_argument(
@@ -162,8 +232,8 @@ parser.add_argument(
 parser.add_argument("-pretrain_model_path", type=str, default="")
 parser.add_argument("-work_dir", type=str, default="./work_dir")
 # train
-parser.add_argument("-num_epochs", type=int, default=1000)
-parser.add_argument("-batch_size", type=int, default=2)
+parser.add_argument("-num_epochs", type=int, default=10)
+parser.add_argument("-batch_size", type=int, default=6)
 parser.add_argument("-num_workers", type=int, default=0)
 # Optimizer parameters
 parser.add_argument(
@@ -179,7 +249,7 @@ parser.add_argument("-use_amp", action="store_true", default=False, help="use am
 parser.add_argument(
     "--resume", type=str, default="", help="Resuming training from checkpoint"
 )
-parser.add_argument("--device", type=str, default="cuda:0")
+parser.add_argument("--device", type=str, default="cpu")
 args = parser.parse_args()
 
 if args.use_wandb:
@@ -201,15 +271,17 @@ if args.use_wandb:
 run_id = datetime.now().strftime("%Y%m%d-%H%M")
 model_save_path = join(args.work_dir, args.task_name + "-" + run_id)
 device = torch.device(args.device)
+
+
 # %% set up model
 
 
 class MedSAM(nn.Module):
     def __init__(
-        self,
-        image_encoder,
-        mask_decoder,
-        prompt_encoder,
+            self,
+            image_encoder,
+            mask_decoder,
+            prompt_encoder,
     ):
         super().__init__()
         self.image_encoder = image_encoder
@@ -219,13 +291,14 @@ class MedSAM(nn.Module):
         for param in self.prompt_encoder.parameters():
             param.requires_grad = False
 
-    def forward(self, image, box):
+    def forward(self, image, boxes):
         image_embedding = self.image_encoder(image)  # (B, 256, 64, 64)
         # do not compute gradients for prompt encoder
         with torch.no_grad():
-            box_torch = torch.as_tensor(box, dtype=torch.float32, device=image.device)
-            if len(box_torch.shape) == 2:
-                box_torch = box_torch[:, None, :]  # (B, 1, 4)
+            for box in boxes:
+                box_torch = torch.as_tensor(boxes, dtype=torch.float32, device=image.device)
+                if len(box_torch.shape) == 2:
+                    box_torch = box_torch[:, None, :]  # (B, 1, 4)
 
             sparse_embeddings, dense_embeddings = self.prompt_encoder(
                 points=None,
@@ -233,22 +306,25 @@ class MedSAM(nn.Module):
                 masks=None,
             )
         low_res_masks, _ = self.mask_decoder(
-            image_embeddings=image_embedding,  # (B, 256, 64, 64)
+            # image_embeddings=image_embedding,  # (B, 256, 64, 64)
             image_pe=self.prompt_encoder.get_dense_pe(),  # (1, 256, 64, 64)
             sparse_prompt_embeddings=sparse_embeddings,  # (B, 2, 256)
             dense_prompt_embeddings=dense_embeddings,  # (B, 256, 64, 64)
             multimask_output=False,
         )
-        ori_res_masks = F.interpolate(
-            low_res_masks,
-            size=(image.shape[2], image.shape[3]),
-            mode="bilinear",
-            align_corners=False,
-        )
-        return ori_res_masks
+        # ori_res_masks = F.interpolate(
+        #     low_res_masks,
+        #     size=(image.shape[2], image.shape[3]),
+        #     mode="bilinear",
+        #     align_corners=False,
+        # )
+        # return ori_res_masks
 
 
 def main():
+    if not os.path.exists("scoliosis2-1"):
+        VertebraDataset.load_roboflow_dataset()
+    pass
     os.makedirs(model_save_path, exist_ok=True)
     shutil.copyfile(
         __file__, join(model_save_path, run_id + "_" + os.path.basename(__file__))
@@ -261,6 +337,10 @@ def main():
         prompt_encoder=sam_model.prompt_encoder,
     ).to(device)
     medsam_model.train()
+
+    # Freeze the image encoder
+    for param in medsam_model.image_encoder.parameters():
+        param.requires_grad = False
 
     print(
         "Number of total parameters: ",
@@ -281,23 +361,42 @@ def main():
         "Number of image encoder and mask decoder parameters: ",
         sum(p.numel() for p in img_mask_encdec_params if p.requires_grad),
     )  # 93729252
+
+    # TODO: AICI SUNT LOSSURILE COMBINATIE DE DICE LOSS + CROSS ENTROPY LOSS
     seg_loss = monai.losses.DiceLoss(sigmoid=True, squared_pred=True, reduction="mean")
     # cross entropy loss
     ce_loss = nn.BCEWithLogitsLoss(reduction="mean")
     # %% train
     num_epochs = args.num_epochs
+    print(num_epochs)
+    pass
     iter_num = 0
     losses = []
     best_loss = 1e10
-    train_dataset = NpyDataset(args.tr_npy_path)
+    annotations_file_path = 'data/annotations_test.json'
+    directory = 'scoliosis2-1/test'
+    size = 1024
+    masks_save_dir = "data/masks_test"
+    transform = A.Compose([
+        A.LongestMaxSize(max_size=size),  # Resize the longer side to 1024
+        A.PadIfNeeded(min_height=size, min_width=size, border_mode=0, p=1.0),  # Pad to 1024x1024
+        A.Normalize(mean=0.0, std=1.0),
+        ToTensorV2(),  # Convert image and masks to PyTorch tensors
+    ], bbox_params=A.BboxParams(format='coco', label_fields=['labels']))  # Bounding box params
 
+    train_dataset_npy = NpyDataset("data/npy/CT_Abd")
+    train_dataset = VertebraDatasetMedSAM(annotations_file_path,
+                                       directory=directory,
+                                       resize=size,
+                                       transform=transform, masks_save_dir=masks_save_dir)
     print("Number of training samples: ", len(train_dataset))
     train_dataloader = DataLoader(
-        train_dataset,
+        train_dataset_npy,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
+        # collate_fn=custom_collate_fn
     )
 
     start_epoch = 0
@@ -320,7 +419,7 @@ def main():
             if args.use_amp:
                 ## AMP
                 with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    medsam_pred = medsam_model(image, boxes_np)
+                    medsam_pred = medsam_model(image, boxes)
                     loss = seg_loss(medsam_pred, gt2D) + ce_loss(
                         medsam_pred, gt2D.float()
                     )
@@ -329,7 +428,7 @@ def main():
                 scaler.update()
                 optimizer.zero_grad()
             else:
-                medsam_pred = medsam_model(image, boxes_np)
+                medsam_pred = medsam_model(image, boxes)
                 loss = seg_loss(medsam_pred, gt2D) + ce_loss(medsam_pred, gt2D.float())
                 loss.backward()
                 optimizer.step()
